@@ -11,3 +11,5 @@ allow hal_graphics_composer_default perfd_socket:sock_file write;
 allow hal_graphics_composer_default sysfs_video4linux:dir search;
 allow hal_graphics_composer_default sysfs_video4linux:lnk_file read;
 allow hal_graphics_composer_default sysfs_video4linux:file { getattr open read };
+
+#allow hal_graphics_composer_default init:binder call;

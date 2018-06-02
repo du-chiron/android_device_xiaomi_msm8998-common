@@ -30,3 +30,5 @@ dontaudit system_server dalvikcache_data_file:file { execute write };
 allow system_server sysfs_input:file write;
 allow system_server sysfs_vibrator:file rw_file_perms;
 allow system_server sysfs_vibrator:dir search;
+
+#allow system_server init:binder call;

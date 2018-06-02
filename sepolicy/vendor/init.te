@@ -52,3 +52,9 @@ allow init system_server:binder call;
 allow init tee_device:chr_file ioctl;
 
 allow init sysfs_devices_system_cpu:dir write;
+
+allow init device_latency:chr_file write;
+allow init self:capability2 block_suspend;
+allow init self:netlink_kobject_uevent_socket read;
+allow init self:udp_socket ioctl;
+allow init sensors_device:chr_file ioctl;
