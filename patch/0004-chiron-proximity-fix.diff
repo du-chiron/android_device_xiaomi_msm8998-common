@@ -1,0 +1,737 @@
+commit 6c6736a99c80f1b52e1e09d26b2d49b8b0f4bd2e
+Author: andr68rus <ashtmb@gmail.com>
+Date:   Wed Mar 14 19:08:31 2018 +0300
+
+    msm8998: ultrasound: Initial open source hal for Elliptic Ultrasound
+
+    * Needed for proximity sensor on Xiaomi Mi MIX
+
+    [Arasthel]: Make required changes for Mi MIX 2 implementation
+    [mikeioannina]: Remove unused code
+
+diff --git a/hal/Android.mk b/hal/Android.mk
+index 8c412cb..3acf0f5 100644
+--- a/hal/Android.mk
++++ b/hal/Android.mk
+@@ -60,7 +60,10 @@ LOCAL_SRC_FILES := \
+ LOCAL_SRC_FILES += audio_extn/audio_extn.c \
+                    audio_extn/utils.c
+ LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
++LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/techpack/audio/include
+ LOCAL_ADDITIONAL_DEPENDENCIES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
++LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/vendor/qcom/opensource/audio-kernel/include
++LOCAL_ADDITIONAL_DEPENDENCIES += $(BOARD_VENDOR_KERNEL_MODULES)
+ LOCAL_CFLAGS += -DUSE_VENDOR_EXTN
+ 
+ ifeq ($(strip $(AUDIO_FEATURE_ENABLED_HDMI_EDID)),true)
+@@ -364,6 +367,11 @@ ifeq ($(strip $($AUDIO_FEATURE_IP_HDLR_ENABLED)),true)
+     LOCAL_SRC_FILES += audio_extn/ip_hdlr_intf.c
+ endif
+ 
++ifeq ($(strip $(AUDIO_FEATURE_ELLIPTIC_ULTRASOUND_SUPPORT)),true)
++    LOCAL_CFLAGS += -DELLIPTIC_ULTRASOUND_ENABLED
++    LOCAL_SRC_FILES += audio_extn/ultrasound.c
++endif
++
+ LOCAL_CFLAGS += -Wall -Werror
+ LOCAL_CFLAGS += -Wno-error=unused-function -Wno-error=unused-label -Wno-error=unused-value -Wno-error=unused-variable 
+ 
+diff --git a/hal/audio_extn/ultrasound.c b/hal/audio_extn/ultrasound.c
+new file mode 100644
+index 0000000..6cd2987
+--- /dev/null
++++ b/hal/audio_extn/ultrasound.c
+@@ -0,0 +1,317 @@
++/*
++ * Copyright (c) 2017 The LineageOS Project
++ * Copyright (c) 2017 Balázs Triszka <balika011@protonmail.ch>
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#define LOG_TAG "ultrasound"
++
++#include <errno.h>
++#include <stdlib.h>
++#include <cutils/log.h>
++#include "audio_hw.h"
++#include "platform_api.h"
++#include <platform.h>
++#include "ultrasound.h"
++
++#define ULTRASOUND_CALIBRATION_FILE "/persist/audio/us_cal"
++#define ULTRASOUND_CALIBRATION_MIXER "Ultrasound Calibration Data"
++#define ULTRASOUND_MANUAL_CALIBRATION_FILE "/persist/audio/us_manual_cal"
++#define ULTRASOUND_MANUAL_CALIBRATION_MIXER "Ultrasound Calibration Profile"
++#define ULTRASOUND_MANUAL_CALIBRATION_BASE 84
++#define ULTRASOUND_SENSITIVITY_MIXER "Ultrasound Gain"
++
++enum {
++    ULTRASOUND_STATUS_DEFAULT,
++    ULTRASOUND_STATUS_STARTED,
++    ULTRASOUND_STATUS_STOPPED,
++};
++
++struct pcm_config pcm_config_us = {
++    .channels = 1,
++    .rate = 96000,
++    .period_size = 1024,
++    .period_count = 2,
++    .format = PCM_FORMAT_S16_LE,
++};
++
++struct ultrasound_device {
++    struct pcm *rx_pcm, *tx_pcm;
++    int state;
++    struct audio_device *adev;
++};
++
++static struct ultrasound_device *us = NULL;
++
++void us_cal_load(void)
++{
++    FILE *f;
++    char buff[5] = {0}, us_cal[64];
++    struct mixer_ctl * ctl;
++    int rc;
++
++    f = fopen(ULTRASOUND_CALIBRATION_FILE, "r");
++    if (!f) {
++        ALOGE("%s: Cannot open calibration file: %s",
++                __func__, ULTRASOUND_CALIBRATION_FILE);
++        return;
++    }
++
++    for (size_t i = 0; i < sizeof(us_cal); i++) {
++        fread(buff, 1, sizeof(buff), f);
++        us_cal[i] = strtol(buff, 0, 16);
++    }
++    fclose(f);
++
++    ctl = mixer_get_ctl_by_name(us->adev->mixer, ULTRASOUND_CALIBRATION_MIXER);
++    if (!ctl) {
++        ALOGE("%s: Could not get ctl for mixer cmd - %s",
++                __func__, ULTRASOUND_CALIBRATION_MIXER);
++        return;
++    }
++
++    rc = mixer_ctl_set_array(ctl, us_cal, sizeof(us_cal));
++    if (rc < 0)
++        ALOGE("%s: Could not set ctl, error:%d ", __func__, rc);
++}
++
++void us_manual_cal_load(void)
++{
++    FILE *f;
++    char buff[5] = {0};
++
++    f = fopen(ULTRASOUND_MANUAL_CALIBRATION_FILE, "r");
++    if (!f) {
++        ALOGE("%s: Cannot open calibration file: %s",
++                __func__, ULTRASOUND_MANUAL_CALIBRATION_FILE);
++        return;
++    }
++
++    fread(buff, 1, sizeof(buff), f);
++    fclose(f);
++
++    us_set_manual_cal(ULTRASOUND_MANUAL_CALIBRATION_BASE + strtol(buff, 0, 0));
++}
++
++int us_init(struct audio_device *adev)
++{
++    ALOGD("%s: enter", __func__);
++
++    if (us) {
++        ALOGI("%s: ultrasound has been initialized!", __func__);
++        return 0;
++    }
++
++    us = calloc(1, sizeof(struct ultrasound_device));
++    if (!us) {
++        ALOGE("%s: Out of memory!", __func__);
++        return -ENOMEM;
++    }
++
++    us->adev = adev;
++
++    us_cal_load();
++    us_manual_cal_load();
++
++    ALOGD("%s: exit, status(0)", __func__);
++
++    return 0;
++}
++
++void us_deinit(void)
++{
++    ALOGD("%s: enter", __func__);
++
++    if (us) {
++        free(us);
++        us = NULL;
++    }
++
++    ALOGD("%s: exit", __func__);
++}
++
++int stop_us(void)
++{
++    struct audio_usecase *rx_usecase, *tx_usecase;
++    int rc = 0;
++
++    ALOGD("%s: enter usecase: ultrasound", __func__);
++
++    us->state = ULTRASOUND_STATUS_STOPPED;
++    if (us->rx_pcm) {
++        pcm_close(us->rx_pcm);
++        us->rx_pcm = NULL;
++    }
++
++    if (us->tx_pcm) {
++        pcm_close(us->tx_pcm);
++        us->tx_pcm = NULL;
++    }
++
++    rx_usecase = get_usecase_from_list(us->adev, USECASE_AUDIO_ULTRASOUND_RX);
++    if (!rx_usecase) {
++        ALOGE("%s: Could not find the usecase (%d) in the list",
++                __func__, USECASE_AUDIO_ULTRASOUND_RX);
++        rc = -EINVAL;
++    } else {
++        disable_audio_route(us->adev, rx_usecase);
++        disable_snd_device(us->adev, rx_usecase->out_snd_device);
++        list_remove(&rx_usecase->list);
++        free(rx_usecase);
++    }
++
++    tx_usecase = get_usecase_from_list(us->adev, USECASE_AUDIO_ULTRASOUND_TX);
++    if (!rx_usecase) {
++        ALOGE("%s: Could not find the usecase (%d) in the list",
++                __func__, USECASE_AUDIO_ULTRASOUND_TX);
++        rc = -EINVAL;
++    } else {
++        disable_audio_route(us->adev, tx_usecase);
++        disable_snd_device(us->adev, tx_usecase->in_snd_device);
++        list_remove(&tx_usecase->list);
++        free(tx_usecase);
++    }
++
++    ALOGD("%s: exit: status(%d)", __func__, rc);
++
++    return rc;
++}
++
++int us_start(void)
++{
++    int rx_device_id, tx_device_id;
++    struct audio_usecase *rx_usecase, *tx_usecase;
++
++    ALOGD("%s: enter", __func__);
++
++    if (!us || us->state == ULTRASOUND_STATUS_STARTED)
++        return -EPERM;
++
++    ALOGD("%s: enter usecase: ultrasound", __func__);
++    rx_device_id = platform_get_pcm_device_id(USECASE_AUDIO_ULTRASOUND_RX, PCM_PLAYBACK);
++    tx_device_id = platform_get_pcm_device_id(USECASE_AUDIO_ULTRASOUND_TX, PCM_CAPTURE);
++    if (rx_device_id < 0 || tx_device_id < 0) {
++        ALOGE("%s: Invalid PCM devices (rx: %d tx: %d) for the usecase(ultrasound)",
++                __func__, rx_device_id, tx_device_id);
++        stop_us();
++        ALOGE("%s: exit: status(%d)", __func__, -EIO);
++        return -EIO;
++    }
++
++    rx_usecase = calloc(1, sizeof(struct audio_usecase));
++    if (!rx_usecase) {
++        ALOGE("%s: Out of memory!", __func__);
++        return -ENOMEM;
++    }
++
++    rx_usecase->type = PCM_PLAYBACK;
++    rx_usecase->out_snd_device = SND_DEVICE_OUT_ULTRASOUND_HANDSET;
++    rx_usecase->id = USECASE_AUDIO_ULTRASOUND_RX;
++    list_add_tail(&us->adev->usecase_list, &rx_usecase->list);
++
++    enable_snd_device(us->adev, SND_DEVICE_OUT_ULTRASOUND_HANDSET);
++    enable_audio_route(us->adev, rx_usecase);
++    ALOGI("%s: Opening PCM playback device card_id(%d) device_id(%d)",
++            __func__, us->adev->snd_card, rx_device_id);
++    us->rx_pcm = pcm_open(us->adev->snd_card, rx_device_id, PCM_OUT, &pcm_config_us);
++    if (us->rx_pcm && !pcm_is_ready(us->rx_pcm)) {
++        ALOGE("%s: %s", __func__, pcm_get_error(us->rx_pcm));
++        stop_us();
++        ALOGE("%s: exit: status(%d)", __func__, -EIO);
++        return -EIO;
++    }
++
++    tx_usecase = calloc(1, sizeof(struct audio_usecase));
++    if (!tx_usecase) {
++        ALOGE("%s: Out of memory!", __func__);
++        return -ENOMEM;
++    }
++
++    tx_usecase->type = PCM_CAPTURE;
++    tx_usecase->in_snd_device = SND_DEVICE_IN_ULTRASOUND_MIC;
++    tx_usecase->id = USECASE_AUDIO_ULTRASOUND_TX;
++    list_add_tail(&us->adev->usecase_list, &tx_usecase->list);
++
++    enable_snd_device(us->adev, SND_DEVICE_IN_ULTRASOUND_MIC);
++    enable_audio_route(us->adev, tx_usecase);
++    ALOGI("%s: Opening PCM capture device card_id(%d) device_id(%d)",
++            __func__, us->adev->snd_card, tx_device_id);
++    us->tx_pcm = pcm_open(us->adev->snd_card, tx_device_id, PCM_IN, &pcm_config_us);
++    if (us->tx_pcm && !pcm_is_ready(us->tx_pcm)) {
++        ALOGD("%s: %s", __func__, pcm_get_error(us->tx_pcm));
++        stop_us();
++        ALOGE("%s: exit: status(%d)", __func__, -EIO);
++        return -EIO;
++    }
++
++    pcm_start(us->rx_pcm);
++    pcm_start(us->tx_pcm);
++    us->state = ULTRASOUND_STATUS_STARTED;
++
++    ALOGD("%s: exit, status(0)", __func__);
++
++    return 0;
++}
++
++int us_stop(void)
++{
++    ALOGD("%s: enter", __func__);
++
++    if (!us || us->state != ULTRASOUND_STATUS_STARTED)
++        return -EPERM;
++
++    stop_us();
++
++    return 0;
++}
++
++int us_set_manual_cal(int value)
++{
++    struct mixer_ctl *ctl;
++    int rc;
++
++    ALOGD("%s: value = %d", __func__, value);
++    ctl = mixer_get_ctl_by_name(us->adev->mixer, ULTRASOUND_MANUAL_CALIBRATION_MIXER);
++    if (!ctl) {
++        ALOGE("%s: Could not get ctl for mixer cmd - %s",
++                __func__, ULTRASOUND_MANUAL_CALIBRATION_MIXER);
++        return -EINVAL;
++    }
++
++    rc = mixer_ctl_set_value(ctl, 0, value);
++    if (rc < 0)
++        ALOGE("%s: Could not set ctl, error:%d ", __func__, rc);
++
++    return rc;
++}
++
++int us_set_sensitivity(int value)
++{
++    struct mixer_ctl *ctl;
++    int rc;
++
++    ALOGD("%s: value = %d", __func__, value);
++    ctl = mixer_get_ctl_by_name(us->adev->mixer, ULTRASOUND_SENSITIVITY_MIXER);
++    if (!ctl) {
++        ALOGE("%s: Could not get ctl for mixer cmd - %s",
++                __func__, ULTRASOUND_SENSITIVITY_MIXER);
++        return -EINVAL;
++    }
++
++    rc = mixer_ctl_set_value(ctl, 0, value);
++    if (rc < 0)
++        ALOGE("%s: Could not set ctl, error:%d ", __func__, rc);
++
++    return rc;
++}
+diff --git a/hal/audio_extn/ultrasound.h b/hal/audio_extn/ultrasound.h
+new file mode 100644
+index 0000000..976ed7d
+--- /dev/null
++++ b/hal/audio_extn/ultrasound.h
+@@ -0,0 +1,37 @@
++/*
++ * Copyright (c) 2017 The LineageOS Project
++ * Copyright (c) 2017 Balázs Triszka <balika011@protonmail.ch>
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#ifndef ULTRASOUND_H
++#define ULTRASOUND_H
++
++#ifndef ELLIPTIC_ULTRASOUND_ENABLED
++#define us_init(adev) (0)
++#define us_deinit() (0)
++#define us_start() (0)
++#define us_stop() (0)
++#define us_set_manual_cal(value) (0)
++#define us_set_sensitivity(value) (0)
++#else
++int us_init(struct audio_device *adev);
++void us_deinit(void);
++int us_start(void);
++int us_stop(void);
++int us_set_manual_cal(int value);
++int us_set_sensitivity(int value);
++#endif
++
++#endif 
+diff --git a/hal/audio_hw.c b/hal/audio_hw.c
+index 7cc4232..53bc27c 100644
+--- a/hal/audio_hw.c
++++ b/hal/audio_hw.c
+@@ -84,6 +84,8 @@
+ #include <log_utils.h>
+ #endif
+ 
++#include "ultrasound.h"
++
+ #define COMPRESS_OFFLOAD_NUM_FRAGMENTS 4
+ /*DIRECT PCM has same buffer sizes as DEEP Buffer*/
+ #define DIRECT_PCM_NUM_FRAGMENTS 2
+@@ -331,6 +333,9 @@ const char * const use_case_table[AUDIO_USECASE_MAX] = {
+     [USECASE_AUDIO_RECORD_AFE_PROXY] = "afe-proxy-record",
+     [USECASE_AUDIO_PLAYBACK_EXT_DISP_SILENCE] = "silence-playback",
+ 
++    [USECASE_AUDIO_ULTRASOUND_RX] = "ultrasound-rx",
++    [USECASE_AUDIO_ULTRASOUND_TX] = "ultrasound-tx",
++
+     /* Transcode loopback cases */
+     [USECASE_AUDIO_TRANSCODE_LOOPBACK] = "audio-transcode-loopback",
+ 
+@@ -838,7 +843,13 @@ int enable_audio_route(struct audio_device *adev,
+     audio_extn_sound_trigger_update_stream_status(usecase, ST_EVENT_STREAM_BUSY);
+     audio_extn_listen_update_stream_status(usecase, LISTEN_EVENT_STREAM_BUSY);
+     audio_extn_utils_send_app_type_cfg(adev, usecase);
++
++    #ifdef ELLIPTIC_ULTRASOUND_ENABLED
++    if (usecase->id != USECASE_AUDIO_ULTRASOUND_RX &&
++        usecase->id != USECASE_AUDIO_ULTRASOUND_TX)
++    #endif
+     audio_extn_utils_send_audio_calibration(adev, usecase);
++
+     if ((usecase->type == PCM_PLAYBACK) && is_offload_usecase(usecase->id)) {
+         out = usecase->stream.out;
+         if (out && out->compr)
+@@ -1165,6 +1176,7 @@ static void check_usecases_codec_backend(struct audio_device *adev,
+     snd_device_t derive_snd_device[AUDIO_USECASE_MAX];
+     int i, num_uc_to_switch = 0;
+     int status = 0;
++    bool match = 0;
+     bool force_restart_session = false;
+     /*
+      * This function is to make sure that all the usecases that are active on
+@@ -1205,12 +1217,14 @@ static void check_usecases_codec_backend(struct audio_device *adev,
+     list_for_each(node, &adev->usecase_list) {
+         usecase = node_to_item(node, struct audio_usecase, list);
+ 
++        match = platform_check_backends_match(snd_device, usecase->out_snd_device);
++
+         ALOGD("%s:becf: (%d) check_usecases curr device: %s, usecase device:%s "
+             "backends match %d",__func__, i,
+               platform_get_snd_device_name(snd_device),
+               platform_get_snd_device_name(usecase->out_snd_device),
+-              platform_check_backends_match(snd_device, usecase->out_snd_device));
+-        if ((usecase->type != PCM_CAPTURE) && (usecase != uc_info)) {
++              match);
++        if (match && (usecase->type != PCM_CAPTURE) && (usecase != uc_info)) {
+             uc_derive_snd_device = derive_playback_snd_device(adev->platform,
+                                                usecase, uc_info, snd_device);
+             if (((uc_derive_snd_device != usecase->out_snd_device) || force_routing) &&
+@@ -3019,6 +3033,7 @@ static int out_standby(struct audio_stream *stream)
+         list_for_each(node, &adev->usecase_list) {
+             uc_info = node_to_item(node, struct audio_usecase, list);
+             if ((uc_info->type == PCM_PLAYBACK) &&
++                (uc_info->stream.out != NULL) &&
+                 (uc_info->out_snd_device != platform_get_output_snd_device(adev->platform, uc_info->stream.out)))
+                 select_devices(adev, uc_info->id);
+         }
+@@ -5819,6 +5834,28 @@ static int adev_set_parameters(struct audio_hw_device *dev, const char *kvpairs)
+         }
+     }
+ 
++    char *result = str_parms_to_str(parms);
++    ALOGI("Params: %s", result);
++    ret = str_parms_get_int(parms, "ultrasound-sensor", &val);
++    ALOGI("Ultrasound enable: %d. val: %d", ret, val);
++    if (ret >= 0) {
++        if (val == 1) {
++            us_start();
++        } else {
++            us_stop();
++        }
++    }
++
++    ret = str_parms_get_int(parms, "ultrasound_set_manual_calibration", &val);
++    if (ret >= 0) {
++        us_set_manual_cal(val);
++    }
++
++    ret = str_parms_get_int(parms, "ultrasound_set_sensitivity", &val);
++    if (ret >= 0) {
++        us_set_sensitivity(val);
++    }
++
+     audio_extn_set_parameters(adev, parms);
+ done:
+     str_parms_destroy(parms);
+@@ -6439,6 +6476,8 @@ static int adev_close(hw_device_t *device)
+         free(device);
+         adev = NULL;
+     }
++    us_deinit();
++
+     pthread_mutex_unlock(&adev_init_lock);
+ 
+     return 0;
+@@ -6758,6 +6797,9 @@ static int adev_open(const hw_module_t *module, const char *name,
+     adev->vr_audio_mode_enabled = false;
+ 
+     audio_extn_ds2_enable(adev);
++
++    us_init(adev);
++
+     *device = &adev->device.common;
+ 
+     audio_extn_utils_update_streams_cfg_lists(adev->platform, adev->mixer,
+diff --git a/hal/audio_hw.h b/hal/audio_hw.h
+index 3127a2b..d14888c 100644
+--- a/hal/audio_hw.h
++++ b/hal/audio_hw.h
+@@ -169,6 +169,9 @@ enum {
+     USECASE_AUDIO_PLAYBACK_AFE_PROXY,
+     USECASE_AUDIO_RECORD_AFE_PROXY,
+ 
++    USECASE_AUDIO_ULTRASOUND_RX,
++    USECASE_AUDIO_ULTRASOUND_TX,
++
+     USECASE_AUDIO_PLAYBACK_EXT_DISP_SILENCE,
+ 
+     USECASE_AUDIO_TRANSCODE_LOOPBACK,
+diff --git a/hal/msm8974/platform.c b/hal/msm8974/platform.c
+index 0764d67..2812fae 100644
+--- a/hal/msm8974/platform.c
++++ b/hal/msm8974/platform.c
+@@ -354,6 +354,10 @@ static int pcm_device_table[AUDIO_USECASE_MAX][2] = {
+                                           AFE_PROXY_RECORD_PCM_DEVICE},
+     [USECASE_AUDIO_RECORD_AFE_PROXY] = {AFE_PROXY_PLAYBACK_PCM_DEVICE,
+                                         AFE_PROXY_RECORD_PCM_DEVICE},
++
++    [USECASE_AUDIO_ULTRASOUND_RX] = {ULTRASOUND_PCM_DEVICE, -1},
++    [USECASE_AUDIO_ULTRASOUND_TX] = {-1, ULTRASOUND_PCM_DEVICE},
++
+     [USECASE_AUDIO_PLAYBACK_EXT_DISP_SILENCE] = {MULTIMEDIA9_PCM_DEVICE, -1},
+     [USECASE_AUDIO_TRANSCODE_LOOPBACK] = {TRANSCODE_LOOPBACK_RX_DEV_ID, TRANSCODE_LOOPBACK_TX_DEV_ID},
+ 
+@@ -445,6 +449,8 @@ static const char * device_table[SND_DEVICE_MAX] = {
+     [SND_DEVICE_OUT_SPEAKER_AND_BT_SCO] = "speaker-and-bt-sco",
+     [SND_DEVICE_OUT_SPEAKER_AND_BT_SCO_WB] = "speaker-and-bt-sco-wb",
+ 
++    [SND_DEVICE_OUT_ULTRASOUND_HANDSET] = "ultrasound-handset",
++
+     /* Capture sound devices */
+     [SND_DEVICE_IN_HANDSET_MIC] = "handset-mic",
+     [SND_DEVICE_IN_HANDSET_MIC_EXTERNAL] = "handset-mic-ext",
+@@ -483,6 +489,8 @@ static const char * device_table[SND_DEVICE_MAX] = {
+     [SND_DEVICE_IN_VOICE_TTY_HCO_USB_MIC] = "voice-tty-hco-usb-mic",
+     [SND_DEVICE_IN_VOICE_RX] = "voice-rx",
+ 
++    [SND_DEVICE_IN_ULTRASOUND_MIC] = "ultrasound-mic",
++
+     [SND_DEVICE_IN_VOICE_REC_MIC] = "voice-rec-mic",
+     [SND_DEVICE_IN_VOICE_REC_MIC_NS] = "voice-rec-mic",
+     [SND_DEVICE_IN_VOICE_REC_DMIC_STEREO] = "voice-rec-dmic-ef",
+@@ -847,6 +855,10 @@ static struct name_to_index usecase_name_index[AUDIO_USECASE_MAX] = {
+     {TO_NAME_INDEX(USECASE_AUDIO_SPKR_CALIB_TX)},
+     {TO_NAME_INDEX(USECASE_AUDIO_PLAYBACK_AFE_PROXY)},
+     {TO_NAME_INDEX(USECASE_AUDIO_RECORD_AFE_PROXY)},
++
++    {TO_NAME_INDEX(USECASE_AUDIO_ULTRASOUND_RX)},
++    {TO_NAME_INDEX(USECASE_AUDIO_ULTRASOUND_TX)},
++
+     {TO_NAME_INDEX(USECASE_AUDIO_PLAYBACK_EXT_DISP_SILENCE)},
+ };
+
+@@ -1025,7 +1037,9 @@ bool platform_send_gain_dep_cal(void *platform, int level) {
+         list_for_each(node, &adev->usecase_list) {
+             usecase = node_to_item(node, struct audio_usecase, list);
+
+-            if (usecase != NULL && usecase->type == PCM_PLAYBACK) {
++            if (usecase != NULL &&
++                usecase->type == PCM_PLAYBACK &&
++                usecase->stream.out->devices & AUDIO_DEVICE_OUT_SPEAKER) {
+                 int new_snd_device[2] = {0};
+                 int i, num_devices = 1;
+
+@@ -1402,6 +1416,7 @@ static void set_platform_defaults(struct platform_data * my_data)
+     hw_interface_table[SND_DEVICE_OUT_SPEAKER_WSA] = strdup("SLIMBUS_0_RX");
+     hw_interface_table[SND_DEVICE_OUT_VOICE_SPEAKER_WSA] = strdup("SLIMBUS_0_RX");
+     hw_interface_table[SND_DEVICE_OUT_VOICE_SPEAKER_2_WSA] = strdup("SLIMBUS_0_RX");
++    hw_interface_table[SND_DEVICE_OUT_ULTRASOUND_HANDSET] = strdup("SLIMBUS_0_RX");
+     hw_interface_table[SND_DEVICE_IN_HANDSET_MIC] = strdup("SLIMBUS_0_TX");
+     hw_interface_table[SND_DEVICE_IN_HANDSET_MIC_EXTERNAL] = strdup("SLIMBUS_0_TX");
+     hw_interface_table[SND_DEVICE_IN_HANDSET_MIC_AEC] = strdup("SLIMBUS_0_TX");
+@@ -1470,6 +1485,7 @@ static void set_platform_defaults(struct platform_data * my_data)
+     hw_interface_table[SND_DEVICE_IN_UNPROCESSED_THREE_MIC] = strdup("SLIMBUS_0_TX");
+     hw_interface_table[SND_DEVICE_IN_UNPROCESSED_QUAD_MIC] = strdup("SLIMBUS_0_TX");
+     hw_interface_table[SND_DEVICE_IN_UNPROCESSED_HEADSET_MIC] = strdup("SLIMBUS_0_TX");
++    hw_interface_table[SND_DEVICE_IN_ULTRASOUND_MIC] = strdup("SLIMBUS_0_TX");
+
+     my_data->max_mic_count = PLATFORM_DEFAULT_MIC_COUNT;
+ 
+diff --git a/hal/msm8974/platform.h b/hal/msm8974/platform.h
+index 93d8ab8..66e6f51 100644
+--- a/hal/msm8974/platform.h
++++ b/hal/msm8974/platform.h
+@@ -142,6 +142,7 @@ enum {
+     SND_DEVICE_OUT_VOICE_SPEAKER_AND_VOICE_HEADPHONES,
+     SND_DEVICE_OUT_VOICE_SPEAKER_AND_VOICE_ANC_HEADSET,
+     SND_DEVICE_OUT_VOICE_SPEAKER_AND_VOICE_ANC_FB_HEADSET,
++    SND_DEVICE_OUT_ULTRASOUND_HANDSET,
+     SND_DEVICE_OUT_END,
+ 
+     /*
+@@ -222,6 +223,7 @@ enum {
+     SND_DEVICE_IN_UNPROCESSED_THREE_MIC,
+     SND_DEVICE_IN_UNPROCESSED_QUAD_MIC,
+     SND_DEVICE_IN_UNPROCESSED_HEADSET_MIC,
++    SND_DEVICE_IN_ULTRASOUND_MIC,
+     SND_DEVICE_IN_END,
+
+     SND_DEVICE_MAX = SND_DEVICE_IN_END,
+@@ -456,6 +458,8 @@ enum {
+ #define AFE_PROXY_PLAYBACK_PCM_DEVICE 7
+ #define AFE_PROXY_RECORD_PCM_DEVICE 8
+
++#define ULTRASOUND_PCM_DEVICE 10
++
+ #ifdef PLATFORM_MSM8x26
+ #define HFP_SCO_RX 28
+ #define HFP_ASM_RX_TX 29
+diff --git a/mm-audio/aenc-aac/qdsp6/Android.mk b/mm-audio/aenc-aac/qdsp6/Android.mk
+index b48c889..78799f3 100644
+--- a/mm-audio/aenc-aac/qdsp6/Android.mk
++++ b/mm-audio/aenc-aac/qdsp6/Android.mk
+@@ -37,7 +37,10 @@ LOCAL_SRC_FILES         := src/aenc_svr.c
+ LOCAL_SRC_FILES         += src/omx_aac_aenc.cpp
+
+ LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
++LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/techpack/audio/include
+ LOCAL_ADDITIONAL_DEPENDENCIES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
++LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/vendor/qcom/opensource/audio-kernel/include
++LOCAL_ADDITIONAL_DEPENDENCIES += $(BOARD_VENDOR_KERNEL_MODULES)
+
+ include $(BUILD_SHARED_LIBRARY)
+
+diff --git a/mm-audio/aenc-amrnb/qdsp6/Android.mk b/mm-audio/aenc-amrnb/qdsp6/Android.mk
+index 0ea3672..10e6d95 100644
+--- a/mm-audio/aenc-amrnb/qdsp6/Android.mk
++++ b/mm-audio/aenc-amrnb/qdsp6/Android.mk
+@@ -37,7 +37,10 @@ LOCAL_SRC_FILES         := src/aenc_svr.c
+ LOCAL_SRC_FILES         += src/omx_amr_aenc.cpp
+
+ LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
++LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/techpack/audio/include
+ LOCAL_ADDITIONAL_DEPENDENCIES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
++LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/vendor/qcom/opensource/audio-kernel/include
++LOCAL_ADDITIONAL_DEPENDENCIES += $(BOARD_VENDOR_KERNEL_MODULES)
+
+ include $(BUILD_SHARED_LIBRARY)
+
+diff --git a/mm-audio/aenc-evrc/qdsp6/Android.mk b/mm-audio/aenc-evrc/qdsp6/Android.mk
+index f495c56..163c8b1 100644
+--- a/mm-audio/aenc-evrc/qdsp6/Android.mk
++++ b/mm-audio/aenc-evrc/qdsp6/Android.mk
+@@ -37,7 +37,10 @@ LOCAL_SRC_FILES         := src/aenc_svr.c
+ LOCAL_SRC_FILES         += src/omx_evrc_aenc.cpp
+ 
+ LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
++LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/techpack/audio/include
+ LOCAL_ADDITIONAL_DEPENDENCIES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
++LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/vendor/qcom/opensource/audio-kernel/include
++LOCAL_ADDITIONAL_DEPENDENCIES += $(BOARD_VENDOR_KERNEL_MODULES)
+ 
+ include $(BUILD_SHARED_LIBRARY)
+ 
+diff --git a/mm-audio/aenc-g711/qdsp6/Android.mk b/mm-audio/aenc-g711/qdsp6/Android.mk
+index fc76dd3..a29d5b8 100644
+--- a/mm-audio/aenc-g711/qdsp6/Android.mk
++++ b/mm-audio/aenc-g711/qdsp6/Android.mk
+@@ -38,7 +38,10 @@ LOCAL_SRC_FILES         += src/omx_g711_aenc.cpp
+ LOCAL_SRC_FILES         += src/omx_log.cpp
+ 
+ LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
++LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/techpack/audio/include
+ LOCAL_ADDITIONAL_DEPENDENCIES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
++LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/vendor/qcom/opensource/audio-kernel/include
++LOCAL_ADDITIONAL_DEPENDENCIES += $(BOARD_VENDOR_KERNEL_MODULES)
+ 
+ 
+ include $(BUILD_SHARED_LIBRARY)
+diff --git a/mm-audio/aenc-qcelp13/qdsp6/Android.mk b/mm-audio/aenc-qcelp13/qdsp6/Android.mk
+index 2f4d4be..5c37a5c 100644
+--- a/mm-audio/aenc-qcelp13/qdsp6/Android.mk
++++ b/mm-audio/aenc-qcelp13/qdsp6/Android.mk
+@@ -37,7 +37,10 @@ LOCAL_SRC_FILES         := src/aenc_svr.c
+ LOCAL_SRC_FILES         += src/omx_qcelp13_aenc.cpp
+ 
+ LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include
++LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/techpack/audio/include
+ LOCAL_ADDITIONAL_DEPENDENCIES += $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr
++LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/vendor/qcom/opensource/audio-kernel/include
++LOCAL_ADDITIONAL_DEPENDENCIES += $(BOARD_VENDOR_KERNEL_MODULES)
+ 
+ 
+ include $(BUILD_SHARED_LIBRARY)
+diff --git a/post_proc/Android.mk b/post_proc/Android.mk
+index 412fd98..bd4ecda 100644
+--- a/post_proc/Android.mk
++++ b/post_proc/Android.mk
+@@ -51,6 +51,10 @@ LOCAL_C_INCLUDES := \
+         $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/include \
+         $(call include-path-for, audio-effects)
+ 
++LOCAL_C_INCLUDES	+= $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/techpack/audio/include
++LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/vendor/qcom/opensource/audio-kernel/include
++LOCAL_ADDITIONAL_DEPENDENCIES += $(BOARD_VENDOR_KERNEL_MODULES)
++
+ include $(BUILD_SHARED_LIBRARY)
+
+
+@@ -112,6 +116,10 @@ LOCAL_C_INCLUDES := \
+         $(call project-path-for,qcom-audio)/hal/audio_extn \
+         external/tinycompress/include
+ 
++LOCAL_C_INCLUDES	+= $(TARGET_OUT_INTERMEDIATES)/KERNEL_OBJ/usr/techpack/audio/include
++LOCAL_C_INCLUDES += $(TARGET_OUT_INTERMEDIATES)/vendor/qcom/opensource/audio-kernel/include
++LOCAL_ADDITIONAL_DEPENDENCIES += $(BOARD_VENDOR_KERNEL_MODULES)
++
+ include $(BUILD_SHARED_LIBRARY)
+ 
+ endif
