@@ -15,7 +15,7 @@
 * along with this program. If not, see <http://www.gnu.org/licenses/>.
 *
 */
-package org.omnirom.device;
+package com.dirtyunicorns.settings.device;
 
 import android.app.AlertDialog;
 import android.app.Dialog;
@@ -43,7 +43,7 @@ import android.widget.AdapterView.OnItemClickListener;
 import android.widget.ListView;
 import android.util.Log;
 
-public class DeviceSettings extends PreferenceFragment implements
+public class TouchscreenGestureSettings extends PreferenceFragment implements
         Preference.OnPreferenceChangeListener {
 
     private static final String KEY_CATEGORY_DISPLAY = "display";
@@ -67,7 +67,11 @@ public class DeviceSettings extends PreferenceFragment implements
     public void onCreatePreferences(Bundle savedInstanceState, String rootKey) {
         setPreferencesFromResource(R.xml.main, rootKey);
         mEnableHAL3 = (SwitchPreference) findPreference(ENABLE_HAL3_KEY);
-        mEnableHAL3.setChecked(SystemProperties.getBoolean(HAL3_SYSTEM_PROPERTY, false));
+        if(SystemProperties.getInt(HAL3_SYSTEM_PROPERTY, 0)!=1) {
+             mEnableHAL3.setChecked(false);
+        } else {
+             mEnableHAL3.setChecked(true);
+        }
         mEnableHAL3.setOnPreferenceChangeListener(this);
 
         mS2S = (ListPreference) findPreference(S2S_KEY);

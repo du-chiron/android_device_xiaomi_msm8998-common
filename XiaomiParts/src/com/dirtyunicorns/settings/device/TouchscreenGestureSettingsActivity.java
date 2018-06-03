@@ -15,7 +15,7 @@
 * along with this program. If not, see <http://www.gnu.org/licenses/>.
 *
 */
-package org.omnirom.device;
+package com.dirtyunicorns.settings.device;
 
 import android.app.Activity;
 import android.app.AlertDialog;
@@ -30,9 +30,9 @@ import android.view.Menu;
 import android.view.MenuInflater;
 import android.view.MenuItem;
 
-public class DeviceSettingsActivity extends Activity {
+public class TouchscreenGestureSettingsActivity extends Activity {
 
-    private DeviceSettings mDeviceSettingsFragment;
+    private TouchscreenGestureSettings mTouchscreenGestureSettingsFragment;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -42,12 +42,12 @@ public class DeviceSettingsActivity extends Activity {
 
         Fragment fragment = getFragmentManager().findFragmentById(android.R.id.content);
         if (fragment == null) {
-            mDeviceSettingsFragment = new DeviceSettings();
+            mTouchscreenGestureSettingsFragment = new TouchscreenGestureSettings();
             getFragmentManager().beginTransaction()
-                .add(android.R.id.content, mDeviceSettingsFragment)
+                .add(android.R.id.content, mTouchscreenGestureSettingsFragment)
                 .commit();
         } else {
-            mDeviceSettingsFragment = (DeviceSettings) fragment;
+            mTouchscreenGestureSettingsFragment = (TouchscreenGestureSettings) fragment;
         }
     }
 

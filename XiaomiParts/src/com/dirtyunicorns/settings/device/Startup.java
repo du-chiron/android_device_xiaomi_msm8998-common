@@ -15,7 +15,7 @@
 * along with this program. If not, see <http://www.gnu.org/licenses/>.
 *
 */
-package org.omnirom.device;
+package com.dirtyunicorns.settings.device;
 
 import android.content.BroadcastReceiver;
 import android.content.Context;
@@ -48,7 +48,7 @@ public class Startup extends BroadcastReceiver {
         SharedPreferences sharedPrefs = PreferenceManager.getDefaultSharedPreferences(context);
         VibratorStrengthPreference.restore(context);
         S2SVibratorStrengthPreference.restore(context);
-        String storedValue = PreferenceManager.getDefaultSharedPreferences(context).getString(DeviceSettings.S2S_KEY, "0");
-        Utils.writeValue(DeviceSettings.FILE_S2S_TYPE, storedValue);
+        String storedValue = PreferenceManager.getDefaultSharedPreferences(context).getString(TouchscreenGestureSettings.S2S_KEY, "0");
+        Utils.writeValue(TouchscreenGestureSettings.FILE_S2S_TYPE, storedValue);
     }
 }
